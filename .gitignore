@@ -1,0 +1,11 @@
+# Output of ./build.sh: EasyShot.app and the iconset
+build/
+
+# macOS Finder metadata
+.DS_Store
+
+# JetBrains IDE settings
+.idea/
+
+# Claude working files
+.claude/
