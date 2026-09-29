@@ -13,7 +13,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "EasyShot")
+        let icon = NSImage(size: CGSize(width: 18, height: 18), flipped: false) { rect in
+            Glyph.draw(in: rect.insetBy(dx: 1, dy: 1), color: .black)
+            return true
+        }
+        icon.isTemplate = true
+        icon.accessibilityDescription = "EasyShot"
+        item.button?.image = icon
         let menu = NSMenu()
         screenshotItem.target = self
         menu.addItem(screenshotItem)

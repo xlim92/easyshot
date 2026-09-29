@@ -24,7 +24,7 @@ A lightweight screenshot tool for macOS, native on Apple Silicon. Press a hotkey
 ./build.sh
 ```
 
-The app is built to `build/EasyShot.app`. Copy it to Applications and launch it:
+The app is built to `build/EasyShot.app`, together with the disk image `build/EasyShot.dmg` for distribution: open it and drag EasyShot to Applications. Or copy the app from the terminal and launch it:
 
 ```bash
 ditto build/EasyShot.app /Applications/EasyShot.app
@@ -92,5 +92,6 @@ Choose **Screenshot Shortcut…** from the menu bar icon and press a new combina
 | `Sources/CaptureView.swift` | Selection, toolbars, drawing interaction, copy and save |
 | `Sources/Annotation.swift` | Drawing tools and drawn objects |
 | `Sources/Pixelate.swift` | Secure mosaic for hiding content |
-| `make-icon.swift` | Renders the app icon during the build |
-| `build.sh` | Builds and signs `build/EasyShot.app` |
+| `Sources/Glyph.swift` | App glyph drawn in code, used for the menu bar item and the app icon |
+| `make-icon.swift` | Renders the app icon from the glyph during the build |
+| `build.sh` | Builds and signs `build/EasyShot.app` and packs it into `build/EasyShot.dmg` |
