@@ -1,4 +1,4 @@
-# Output of ./build.sh: EasyShot.app and the iconset
+# Output of ./build.sh and windows/build.sh: EasyShot.app, EasyShot.exe and the icons
 build/
 
 # macOS Finder metadata
@@ -9,3 +9,9 @@ build/
 
 # Claude working files
 .claude/
+
+# .NET build output of the Windows version
+windows/bin/
+windows/obj/
+windows_native/bin/
+windows_native/obj/
