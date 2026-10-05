@@ -13,5 +13,3 @@ build/
 # .NET build output of the Windows version
 windows/bin/
 windows/obj/
-windows_native/bin/
-windows_native/obj/

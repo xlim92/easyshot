@@ -1,5 +1,3 @@
-using SkiaSharp;
-
 namespace EasyShot;
 
 /// Drawing tools; the letter is the keyboard shortcut.
@@ -8,21 +6,17 @@ enum Tool { Pencil, Line, Arrow, Rectangle, FilledRect, Ellipse, Marker, Text, P
 /// A drawn object. Coordinates are in screen points (1/96 inch) with the y axis pointing down.
 /// Size is in the tool's units: line width, font size, radius of the numbered circle, mosaic block size,
 /// corner radius of the filled rectangle. Points: the whole path for the pencil, the anchor point for text, [start, end] for the rest.
-sealed record Annotation(Tool Tool, SKColor Color, int Size, SKPoint[] Points)
+sealed record Annotation(Tool Tool, uint Color, int Size, Vector2[] Points)
 {
-    public static readonly SKTypeface Medium = Typeface(SKFontStyleWeight.Medium);
-    public static readonly SKTypeface Bold = Typeface(SKFontStyleWeight.Bold);
-
     public string Text { get; init; } = "";
     public int Number { get; init; }
     /// Rendered mosaic; the caller recomputes it whenever the geometry changes.
-    public SKImage? Pixelated { get; init; }
+    public Mosaic? Pixelated { get; init; }
 
-    public SKPoint Start => Points[0];
-    public SKPoint End => Points[^1];
-    public SKRect Box => new(Math.Min(Start.X, End.X), Math.Min(Start.Y, End.Y), Math.Max(Start.X, End.X), Math.Max(Start.Y, End.Y));
-
-    public static SKFont TextFont(int size) => new(Medium, size);
+    public Vector2 Start => Points[0];
+    public Vector2 End => Points[^1];
+    public RectangleF Box => RectangleF.FromLTRB(MathF.Min(Start.X, End.X), MathF.Min(Start.Y, End.Y), MathF.Max(Start.X, End.X), MathF.Max(Start.Y, End.Y));
+    public Font Font => Font.Get(Size);
 
     /// Empty objects (a click without dragging, empty text) are not added to the history.
     public bool IsValid => Tool switch
@@ -33,19 +27,17 @@ sealed record Annotation(Tool Tool, SKColor Color, int Size, SKPoint[] Points)
     };
 
     /// Text frame with 4pt padding.
-    public SKRect TextRect
+    public RectangleF TextRect
     {
         get
         {
-            using var font = TextFont(Size);
-            var lines = Text.Split('\n');
-            return SKRect.Create(Start.X, Start.Y, MathF.Ceiling(lines.Max(line => font.MeasureText(line))) + 8,
-                                 MathF.Ceiling(lines.Length * font.Spacing) + 8);
+            var size = Font.Measure(Text);
+            return new RectangleF(Start.X, Start.Y, MathF.Ceiling(size.X) + 8, MathF.Ceiling(size.Y) + 8);
         }
     }
 
     /// Object area used for the selection frame.
-    public SKRect Bounds
+    public RectangleF Bounds
     {
         get
         {
@@ -55,160 +47,159 @@ sealed record Annotation(Tool Tool, SKColor Color, int Size, SKPoint[] Points)
                     return TextRect;
                 case Tool.Counter:
                     var r = Size + 2f;
-                    return new SKRect(Math.Min(Start.X - r, End.X), Math.Min(Start.Y - r, End.Y), Math.Max(Start.X + r, End.X), Math.Max(Start.Y + r, End.Y));
+                    return RectangleF.FromLTRB(MathF.Min(Start.X - r, End.X), MathF.Min(Start.Y - r, End.Y), MathF.Max(Start.X + r, End.X), MathF.Max(Start.Y + r, End.Y));
                 case Tool.FilledRect or Tool.Pixelate or Tool.Invert:
                     return Box;
                 default:
                     var pad = Size / 2f + 3;
-                    return new SKRect(Points.Min(p => p.X) - pad, Points.Min(p => p.Y) - pad, Points.Max(p => p.X) + pad, Points.Max(p => p.Y) + pad);
+                    float left = Start.X, top = Start.Y, right = Start.X, bottom = Start.Y;
+                    foreach (var p in Points)
+                    {
+                        left = MathF.Min(left, p.X);
+                        top = MathF.Min(top, p.Y);
+                        right = MathF.Max(right, p.X);
+                        bottom = MathF.Max(bottom, p.Y);
+                    }
+                    return RectangleF.FromLTRB(left - pad, top - pad, right + pad, bottom + pad);
             }
         }
     }
 
     /// Hit testing: lines and outlines are hit along the stroke with 4pt tolerance; fills, text and circles anywhere inside.
-    public bool Contains(SKPoint p)
+    public bool Contains(Vector2 p)
     {
-        if (Tool is Tool.Text or Tool.Counter or Tool.FilledRect or Tool.Pixelate or Tool.Invert)
-            return SKRect.Inflate(Bounds, 4, 4).Contains(p);
-        using var builder = new SKPathBuilder();
+        var reach = (Size + 8) / 2f;
         switch (Tool)
         {
+            case Tool.Text or Tool.Counter or Tool.FilledRect or Tool.Pixelate or Tool.Invert:
+                var bounds = Bounds;
+                bounds.Inflate(4, 4);
+                return bounds.Contains(p.X, p.Y);
             case Tool.Rectangle:
-                builder.AddRect(Box);
-                break;
+                var box = Box;
+                Vector2 a = new(box.Left, box.Top), b = new(box.Right, box.Top), c = new(box.Right, box.Bottom), d = new(box.Left, box.Bottom);
+                return MathF.Min(MathF.Min(Distance(p, a, b), Distance(p, b, c)), MathF.Min(Distance(p, c, d), Distance(p, d, a))) <= reach;
             case Tool.Ellipse:
-                builder.AddOval(Box);
-                break;
+                // Distance to the outline, estimated from the ellipse equation and its gradient.
+                var e = Box;
+                float rx = e.Width / 2, ry = e.Height / 2;
+                if (rx == 0 || ry == 0)
+                    return Distance(p, Start, End) <= reach;
+                var q = p - new Vector2(e.X + rx, e.Y + ry);
+                var f = q.X * q.X / (rx * rx) + q.Y * q.Y / (ry * ry) - 1;
+                var gradient = 2 * MathF.Sqrt(q.X * q.X / (rx * rx * rx * rx) + q.Y * q.Y / (ry * ry * ry * ry));
+                return gradient > 0 ? MathF.Abs(f) / gradient <= reach : MathF.Min(rx, ry) <= reach;
             default:
-                builder.AddPoly(Points, false);
-                break;
+                for (var i = 1; i < Points.Length; i++)
+                {
+                    if (Distance(p, Points[i - 1], Points[i]) <= reach)
+                        return true;
+                }
+                return false;
         }
-        using var path = builder.Detach();
-        using var stroke = new SKPaint { IsStroke = true, StrokeWidth = Size + 8, StrokeCap = SKStrokeCap.Round, StrokeJoin = SKStrokeJoin.Round };
-        using var outline = stroke.GetFillPath(path);
-        return outline.Contains(p.X, p.Y);
     }
 
-    public Annotation Moved(SKPoint d) => this with { Points = [.. Points.Select(p => p + d)] };
-
-    /// Draws the object onto the canvas (y grows downwards).
-    public void Draw(SKCanvas canvas)
+    public Annotation Moved(Vector2 offset)
     {
-        using var paint = new SKPaint
-        {
-            IsAntialias = true, Color = Color, IsStroke = true, StrokeWidth = Size, StrokeCap = SKStrokeCap.Round, StrokeJoin = SKStrokeJoin.Round,
-        };
+        var points = new Vector2[Points.Length];
+        for (var i = 0; i < points.Length; i++)
+            points[i] = Points[i] + offset;
+        return this with { Points = points };
+    }
+
+    public void Draw(Canvas canvas)
+    {
         switch (Tool)
         {
             case Tool.Pencil:
-                using (var path = Polyline(Points))
-                    canvas.DrawPath(path, paint);
+                canvas.Lines(Points, Color, Size);
                 break;
             case Tool.Line:
-                canvas.DrawLine(Start, End, paint);
+                canvas.Line(Start, End, Color, Size);
                 break;
             case Tool.Arrow:
-                DrawArrow(canvas, paint);
+                DrawArrow(canvas);
                 break;
             case Tool.Rectangle:
-                canvas.DrawRect(Box, paint);
+                canvas.StrokeRect(Box, Color, Size);
                 break;
             case Tool.FilledRect:
-                var radius = Math.Min(Size, Math.Min(Box.Width / 2, Box.Height / 2));
-                paint.IsStroke = false;
-                canvas.DrawRoundRect(Box, radius, radius, paint);
+                var box = Box;
+                canvas.FillRoundRect(box, MathF.Min(Size, MathF.Min(box.Width, box.Height) / 2), Color);
                 break;
             case Tool.Ellipse:
-                canvas.DrawOval(Box, paint);
+                canvas.StrokeEllipse(Box, Color, Size);
                 break;
             case Tool.Marker:
                 // A semi-transparent stroke with multiply blending keeps the text underneath crisp.
-                paint.BlendMode = SKBlendMode.Multiply;
-                paint.Color = Color.WithAlpha(102);
-                paint.StrokeCap = SKStrokeCap.Butt;
-                canvas.DrawLine(Start, End, paint);
+                canvas.Multiply(Start, End, Size, Color, 0.4f);
                 break;
             case Tool.Text:
-                paint.IsStroke = false;
-                using (var font = TextFont(Size))
-                {
-                    var lines = Text.Split('\n');
-                    for (var i = 0; i < lines.Length; i++)
-                        canvas.DrawTextAt(lines[i], new SKPoint(Start.X + 4, Start.Y + 4 + i * font.Spacing), font, paint);
-                }
+                canvas.Text(Text, Start + new Vector2(4), Font, Color);
                 break;
             case Tool.Pixelate:
                 if (Pixelated != null)
-                    canvas.DrawImage(Pixelated, Box, new SKSamplingOptions(SKFilterMode.Nearest));
+                    canvas.Mosaic(Box, Pixelated);
                 break;
             case Tool.Counter:
-                DrawCounter(canvas, paint);
+                DrawCounter(canvas);
                 break;
             case Tool.Invert:
-                // Difference blending with white inverts everything under the area.
-                paint.IsStroke = false;
-                paint.BlendMode = SKBlendMode.Difference;
-                paint.Color = SKColors.White;
-                canvas.DrawRect(Box, paint);
+                // Everything under the area is inverted, like difference blending with white.
+                canvas.Invert(Box);
                 break;
         }
     }
 
     /// Shaft up to the base of the head plus a triangular head: length is 3 × line width + 8pt, width is 1.2 × length.
-    private void DrawArrow(SKCanvas canvas, SKPaint paint)
+    private void DrawArrow(Canvas canvas)
     {
-        var length = SKPoint.Distance(Start, End);
+        var length = Vector2.Distance(Start, End);
         if (length <= 0)
             return;
-        var u = new SKPoint((End.X - Start.X) / length, (End.Y - Start.Y) / length);
-        var head = Math.Min(3 * Size + 8, length);
+        var u = (End - Start) / length;
+        var head = MathF.Min(3 * Size + 8, length);
         var spread = head * 0.6f;
-        var neck = new SKPoint(End.X - u.X * head, End.Y - u.Y * head);
-        canvas.DrawLine(Start, neck, paint);
-        paint.IsStroke = false;
-        using var tip = Polyline([End, new(neck.X + u.Y * spread, neck.Y - u.X * spread), new(neck.X - u.Y * spread, neck.Y + u.X * spread)], true);
-        canvas.DrawPath(tip, paint);
+        var neck = End - u * head;
+        canvas.Line(Start, neck, Color, Size);
+        canvas.FillPolygon([End, new(neck.X + u.Y * spread, neck.Y - u.X * spread), new(neck.X - u.Y * spread, neck.Y + u.X * spread)], Color);
     }
 
     /// Numbered circle with a white outline; dragging while placing it adds a pointer to the release point.
-    private void DrawCounter(SKCanvas canvas, SKPaint paint)
+    private void DrawCounter(Canvas canvas)
     {
         float r = Size, outline = MathF.Max(1.5f, r / 8);
-        paint.IsStroke = false;
-        paint.Color = SKColors.White;
-        canvas.DrawCircle(Start, r + outline, paint);
-        paint.Color = Color;
-        if (SKPoint.Distance(Start, End) > r)
+        canvas.FillEllipse(Circle(Start, r + outline), 0xFFFFFFFF);
+        if (Vector2.Distance(Start, End) > r)
         {
             var angle = MathF.Atan2(End.Y - Start.Y, End.X - Start.X);
             const float spread = 0.45f;
-            using var pointer = Polyline([
-                Start,
-                new(Start.X + r * MathF.Cos(angle - spread), Start.Y + r * MathF.Sin(angle - spread)),
-                End,
-                new(Start.X + r * MathF.Cos(angle + spread), Start.Y + r * MathF.Sin(angle + spread)),
-            ], true);
-            canvas.DrawPath(pointer, paint);
+            canvas.FillPolygon([Start, Start + r * Direction(angle - spread), End, Start + r * Direction(angle + spread)], Color);
         }
-        canvas.DrawCircle(Start, r, paint);
+        canvas.FillEllipse(Circle(Start, r), Color);
 
         var label = $"{Number}";
-        using var font = new SKFont(Bold, r * 1.1f);
-        while (font.MeasureText(label) > 1.5f * r && font.Size > 2)
-            font.Size -= 1;
-        paint.Color = Color.IsDark ? SKColors.White : SKColors.Black;
-        canvas.DrawCenteredText(label, Start, font, paint);
+        var fontSize = r * 1.1f;
+        while (Font.Get(fontSize, bold: true).Width(label) > 1.5f * r && fontSize > 2)
+            fontSize -= 1;
+        var font = Font.Get(fontSize, bold: true);
+        canvas.Text(label, Start - new Vector2(font.Width(label), font.LineHeight) / 2, font, IsDark(Color) ? 0xFFFFFFFF : 0xFF000000);
     }
 
-    private static SKPath Polyline(ReadOnlySpan<SKPoint> points, bool close = false)
+    public static RectangleF Circle(Vector2 center, float radius) => new(center.X - radius, center.Y - radius, 2 * radius, 2 * radius);
+
+    /// Whether the color is dark by BT.601 luma; used to pick a contrasting number color.
+    public static bool IsDark(uint color) => 0.299f * (color >> 16 & 0xFF) + 0.587f * (color >> 8 & 0xFF) + 0.114f * (color & 0xFF) < 0.6f * 255;
+
+    private static Vector2 Direction(float angle) => new(MathF.Cos(angle), MathF.Sin(angle));
+
+    /// Distance from p to the segment ab.
+    private static float Distance(Vector2 p, Vector2 a, Vector2 b)
     {
-        using var builder = new SKPathBuilder();
-        builder.AddPoly(points, close);
-        return builder.Detach();
+        var ab = b - a;
+        var t = ab == Vector2.Zero ? 0 : Math.Clamp(Vector2.Dot(p - a, ab) / ab.LengthSquared(), 0, 1);
+        return Vector2.Distance(p, a + t * ab);
     }
-
-    private static SKTypeface Typeface(SKFontStyleWeight weight) =>
-        SKTypeface.FromFamilyName("Segoe UI", weight, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
 }
 
 static class Extensions
@@ -257,40 +248,20 @@ static class Extensions
         };
 
         /// With Shift: lines snap to 45° steps, rectangular shapes and ellipses become squares and circles.
-        public SKPoint Constrained(SKPoint v)
+        public Vector2 Constrained(Vector2 v)
         {
             switch (tool)
             {
                 case Tool.Line or Tool.Arrow or Tool.Marker:
                     var step = MathF.PI / 4;
                     var angle = MathF.Round(MathF.Atan2(v.Y, v.X) / step) * step;
-                    return new SKPoint(v.Length * MathF.Cos(angle), v.Length * MathF.Sin(angle));
+                    return v.Length() * new Vector2(MathF.Cos(angle), MathF.Sin(angle));
                 case Tool.Rectangle or Tool.FilledRect or Tool.Ellipse or Tool.Pixelate or Tool.Invert:
-                    var side = Math.Max(Math.Abs(v.X), Math.Abs(v.Y));
-                    return new SKPoint(v.X < 0 ? -side : side, v.Y < 0 ? -side : side);
+                    var side = MathF.Max(MathF.Abs(v.X), MathF.Abs(v.Y));
+                    return new Vector2(v.X < 0 ? -side : side, v.Y < 0 ? -side : side);
                 default:
                     return v;
             }
-        }
-    }
-
-    extension(SKColor color)
-    {
-        /// Whether the color is dark by BT.601 luma; used to pick a contrasting number color.
-        public bool IsDark => 0.299 * color.Red + 0.587 * color.Green + 0.114 * color.Blue < 0.6 * 255;
-    }
-
-    extension(SKCanvas canvas)
-    {
-        /// Draws a line of text with its top-left corner at the point.
-        public void DrawTextAt(string text, SKPoint topLeft, SKFont font, SKPaint paint) =>
-            canvas.DrawText(text, topLeft.X, topLeft.Y - font.Metrics.Ascent, SKTextAlign.Left, font, paint);
-
-        /// Draws text centered on the point by its glyphs, so digits sit in the middle of a circle.
-        public void DrawCenteredText(string text, SKPoint center, SKFont font, SKPaint paint)
-        {
-            font.MeasureText(text, out var bounds);
-            canvas.DrawText(text, center.X - bounds.MidX, center.Y - bounds.MidY, SKTextAlign.Left, font, paint);
         }
     }
 }

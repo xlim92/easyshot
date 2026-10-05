@@ -48,15 +48,7 @@ The script builds `build/EasyShot.app` and the disk image `build/EasyShot.dmg`: 
 
 Runs on 64-bit Windows 10 and 11. EasyShot lives in the notification area: a click on its icon takes a screenshot, a right click opens the menu. The exe isn't signed, so SmartScreen warns on first launch: More info → Run anyway.
 
-There are two builds with the same features:
-
-- `windows`: WinForms and SkiaSharp, built on a Mac with the .NET 10 SDK and Swift, which renders the icon. The script makes `build/EasyShot.exe`, a single file with the .NET runtime inside.
-
-  ```bash
-  windows/build.sh
-  ```
-
-- `windows_native`: plain Win32 and GDI+, compiled with Native AOT into a small native exe. It is built on Windows with the .NET 10 SDK and the C++ build tools of Visual Studio, whose linker Native AOT uses; the ARM64 tools are needed for ARM builds and on Windows on ARM:
+Plain Win32 and GDI+, compiled with Native AOT into a small native exe. It is built on Windows with the .NET 10 SDK and the C++ build tools of Visual Studio, whose linker Native AOT uses; the ARM64 tools are needed for ARM builds and on Windows on ARM:
 
   ```bat
   winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --add Microsoft.VisualStudio.Component.VC.Tools.ARM64"
@@ -65,5 +57,5 @@ There are two builds with the same features:
   The script makes `build\native\EasyShot.exe`; `build.cmd win-arm64` builds for ARM.
 
   ```bat
-  windows_native\build.cmd
+  windows\build.cmd
   ```

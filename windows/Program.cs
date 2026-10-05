@@ -1,6 +1,6 @@
 namespace EasyShot;
 
-static class Program
+static unsafe class Program
 {
     [STAThread]
     static void Main()
@@ -9,7 +9,15 @@ static class Program
         using var mutex = new Mutex(true, "EasyShot", out var isFirst);
         if (!isFirst)
             return;
-        ApplicationConfiguration.Initialize();
-        Application.Run(new TrayApp());
+        var input = new GdiplusStartupInput { GdiplusVersion = 1 };
+        nuint token;
+        PInvoke.GdiplusStartup(&token, &input, null);
+        _ = new App();
+        MSG message;
+        while (PInvoke.GetMessage(&message, HWND.Null, 0, 0).Value > 0)
+        {
+            PInvoke.TranslateMessage(&message);
+            PInvoke.DispatchMessage(&message);
+        }
     }
 }

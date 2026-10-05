@@ -1,61 +1,55 @@
-using System.Runtime.InteropServices;
-using SkiaSharp;
+using Windows.Win32.System.SystemServices;
 
 namespace EasyShot;
 
-/// Capture screen: dimmed screenshot, area selection with a resizable frame, toolbars next to the frame
+/// Capture screen of one display: dimmed screenshot, area selection with a resizable frame, toolbars next to the frame
 /// and drawing on top of the screenshot: tools, Shift constraints, mouse wheel sizing, color ring, object editing.
-/// Everything, toolbars included, is drawn with SkiaSharp in points (1/96 inch) at the display's scale.
-sealed partial class CaptureView : Control
+/// Everything, toolbars included, is drawn in points (1/96 inch) at the display's scale.
+sealed unsafe class CaptureView : Window
 {
     private abstract record Drag;
-    private sealed record Selecting(SKPoint Start) : Drag;
-    private sealed record MovingSelection(SKPoint Start, SKRect Original) : Drag;
-    private sealed record Resizing(int Dx, int Dy, SKRect Original) : Drag;
+    private sealed record Selecting(Vector2 Start) : Drag;
+    private sealed record MovingSelection(Vector2 Start, RectangleF Original) : Drag;
+    private sealed record Resizing(int Dx, int Dy, RectangleF Original) : Drag;
     private sealed record Drawing : Drag;
-    private sealed record MovingObject(SKPoint Start, List<Annotation> Before) : Drag;
+    private sealed record MovingObject(Vector2 Start, List<Annotation> Before) : Drag;
     private sealed record Pressing(BarButton Button) : Drag;
 
-    /// Toolbar button; its icon is drawn in the accent color while Active returns true.
-    private sealed record BarButton(string Icon, string Tip, Action Run, Func<bool>? Active = null);
+    /// Toolbar button: an icon, or the current color when Icon is null; the icon is in the accent color while Active returns true.
+    private sealed record BarButton(Icon? Icon, string Tip, Action Run, Func<bool>? Active = null);
 
     /// Text being typed right on the screenshot. Text taken for editing starts fully selected, so typing replaces it.
-    private sealed class TextEditor(SKPoint origin, string text, SKColor color)
+    private sealed class TextEditor(Vector2 origin, string text, uint color)
     {
-        public readonly SKPoint Origin = origin;
+        public readonly Vector2 Origin = origin;
         public string Text = text;
         public int Caret = text.Length;
         public bool AllSelected = text.Length > 0;
-        public SKColor Color = color;
+        public uint Color = color;
     }
 
     private static readonly (int Dx, int Dy)[] Handles = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
-    private static readonly SKColor[] Palette =
-    [
-        .. new uint[] { 0xFF3B30, 0xFF9500, 0xFFCC00, 0x34C759, 0x00C7BE, 0x007AFF, 0xAF52DE, 0xFF2D55, 0x000000, 0xFFFFFF }
-            .Select(rgb => new SKColor(0xFF000000 | rgb)),
-    ];
+    private static readonly uint[] Palette = [0xFFFF3B30, 0xFFFF9500, 0xFFFFCC00, 0xFF34C759, 0xFF00C7BE, 0xFF007AFF, 0xFFAF52DE, 0xFFFF2D55, 0xFF000000, 0xFFFFFFFF];
     /// Palette swatches sit on a ring with a gap between neighbors.
-    private static readonly float RingRadius = Math.Max(44, Palette.Length * 34 / (2 * MathF.PI));
-    private const int MinSize = 1, MaxSize = 72;
-    private const int UndoLimit = 200;
+    private static readonly float RingRadius = MathF.Max(44, Palette.Length * 34 / (2 * MathF.PI));
+    private static readonly float[] FrameDash = [4, 4], ObjectDash = [5, 3];
+    private const int MinSize = 1, MaxSize = 72, UndoLimit = 200;
     private const float ButtonSize = 30, BarInset = 3;
-    private static readonly SKSamplingOptions Nearest = new(SKFilterMode.Nearest);
-    private static readonly SKPathEffect FrameDash = SKPathEffect.CreateDash([4, 4], 0), ObjectDash = SKPathEffect.CreateDash([5, 3], 0);
-    private static readonly SKColor Gray = new(85, 85, 85);
+    private const nuint TipTimer = 1, HintTimer = 2;
+    private const uint White = 0xFFFFFFFF, Black = 0xFF000000, Gray = 0xFF555555, BarColor = 0xFFF7F7F7, HoverColor = 0x14000000;
     /// Color and tool sizes are remembered between screenshots while the app is running.
-    private static SKColor color = Palette[0];
+    private static uint color = Palette[0];
     private static readonly Dictionary<Tool, int> Sizes = [];
 
-    private readonly SKImage screenshot;
-    /// The screenshot with the dimming baked in, shown outside the selection.
-    private readonly SKImage dimmed;
+    private readonly RECT bounds;
+    private readonly Pixels screenshot, dimmed, frame;
     private readonly Action onClose;
     private readonly BarButton[] toolsBar, actionsBar;
-    private readonly ToolTip tip = new();
-    private SKBitmap? frame;
+    private readonly uint accent;
+    /// Pixels per point on this display.
+    private readonly float scale;
 
-    private SKRect? selection;
+    private RectangleF? selection;
     private Drag? drag;
     private List<Annotation> annotations = [];
     private readonly List<List<Annotation>> undoStack = [], redoStack = [];
@@ -67,286 +61,329 @@ sealed partial class CaptureView : Control
     private TextEditor? editor;
     private int? editing;
     private int editorSize = 8;
-    private (SKPoint Center, int? Hovered)? picker;
-    private SKPoint? mouse;
-    private BarButton? hovered;
+    private (Vector2 Center, int? Hovered)? picker;
+    private Vector2? mouse;
+    private bool tracking;
+    private BarButton? hovered, tip;
     private int wheel;
-    private DateTime sizeHintUntil;
+    private bool sizeHint;
 
-    public CaptureView(SKImage screenshot, Action onClose)
+    public CaptureView(RECT bounds, Pixels screenshot, Action onClose)
     {
+        this.bounds = bounds;
         this.screenshot = screenshot;
         this.onClose = onClose;
-        using (var surface = SKSurface.Create(screenshot.Info))
+        // 45% black over the screenshot, baked in once.
+        dimmed = new Pixels(screenshot.Width, screenshot.Height);
+        for (var i = 0; i < screenshot.Width * screenshot.Height; i++)
         {
-            using var shade = new SKPaint { Color = new SKColor(0, 0, 0, 115) };
-            surface.Canvas.DrawImage(screenshot, 0, 0, Nearest);
-            surface.Canvas.DrawRect(SKRect.Create(screenshot.Width, screenshot.Height), shade);
-            dimmed = surface.Snapshot();
+            var c = screenshot.Data[i];
+            dimmed.Data[i] = 0xFF000000 | (c >> 16 & 0xFF) * 141 >> 8 << 16 | (c >> 8 & 0xFF) * 141 >> 8 << 8 | (c & 0xFF) * 141 >> 8;
         }
-        // The view paints every pixel itself, with no background erase in between.
-        SetStyle(ControlStyles.Opaque | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
-        Cursor = Cursors.Cross;
+        frame = new Pixels(screenshot.Width, screenshot.Height);
+        // The selection color of the system, like the accent color on macOS.
+        var highlight = PInvoke.GetSysColor(SYS_COLOR_INDEX.COLOR_HIGHLIGHT);
+        accent = 0xFF000000 | (highlight & 0xFF) << 16 | (highlight & 0xFF00) | highlight >> 16 & 0xFF;
 
-        toolsBar =
-        [
-            new("Move", "Выбор и перемещение объектов (V, Esc)", SelectMoveMode, () => tool == null),
-            .. Enum.GetValues<Tool>().Select(t => new BarButton(t.ToString(), t.Title + (t.Key is { } key ? $" ({key})" : ""), () => SelectTool(t), () => tool == t)),
-            new("Color", "Цвет (или правая кнопка мыши)", PickColor),
-            new("Undo", "Отменить (Ctrl+Z)", Undo),
-            new("Redo", "Повторить (Ctrl+Shift+Z)", Redo),
-        ];
+        var tools = new List<BarButton> { new(Icon.Move, "Выбор и перемещение объектов (V, Esc)", SelectMoveMode, () => tool == null) };
+        for (var t = Tool.Pencil; t <= Tool.Invert; t++)
+        {
+            var each = t;
+            tools.Add(new BarButton((Icon)each, each.Title + (each.Key is { } key ? $" ({key})" : ""), () => SelectTool(each), () => tool == each));
+        }
+        tools.Add(new BarButton(null, "Цвет (или правая кнопка мыши)", PickColor));
+        tools.Add(new BarButton(Icon.Undo, "Отменить (Ctrl+Z)", Undo));
+        tools.Add(new BarButton(Icon.Redo, "Повторить (Ctrl+Shift+Z)", Redo));
+        toolsBar = [.. tools];
         actionsBar =
         [
-            new("Copy", "Копировать (Ctrl+C, Enter)", CopyImage),
-            new("Save", "Сохранить (Ctrl+S)", SaveImage),
-            new("Close", "Закрыть (Esc)", onClose),
+            new BarButton(Icon.Copy, "Копировать (Ctrl+C, Enter)", CopyImage),
+            new BarButton(Icon.Save, "Сохранить (Ctrl+S)", SaveImage),
+            new BarButton(Icon.Close, "Закрыть (Esc)", onClose),
         ];
+
+        // Topmost above the taskbar; a tool window has no taskbar button.
+        Create("EasyShotOverlay", WINDOW_EX_STYLE.WS_EX_TOPMOST | WINDOW_EX_STYLE.WS_EX_TOOLWINDOW, WINDOW_STYLE.WS_POPUP, "",
+               bounds.left, bounds.top, screenshot.Width, screenshot.Height);
+        scale = PInvoke.GetDpiForWindow(Handle) / 96f;
     }
 
-    protected override void Dispose(bool disposing)
+    public bool Contains(System.Drawing.Point p) => p.X >= bounds.left && p.X < bounds.right && p.Y >= bounds.top && p.Y < bounds.bottom;
+
+    public void Show(bool activate)
     {
-        if (disposing)
-        {
-            screenshot.Dispose();
-            dimmed.Dispose();
-            frame?.Dispose();
-            tip.Dispose();
-        }
-        base.Dispose(disposing);
+        PInvoke.ShowWindow(Handle, activate ? SHOW_WINDOW_CMD.SW_SHOW : SHOW_WINDOW_CMD.SW_SHOWNA);
+        if (activate)
+            PInvoke.SetForegroundWindow(Handle);
     }
-
-    /// Pixels per point on this display.
-    private float PixelScale => DeviceDpi / 96f;
 
     /// The view's bounds in points.
-    private SKRect Area => SKRect.Create(ClientSize.Width / PixelScale, ClientSize.Height / PixelScale);
+    private RectangleF Area => new(0, 0, frame.Width / scale, frame.Height / scale);
 
-    private static SKColor Accent => new(SystemColors.Highlight.R, SystemColors.Highlight.G, SystemColors.Highlight.B);
+    protected override LRESULT OnMessage(uint message, WPARAM wParam, LPARAM lParam)
+    {
+        switch (message)
+        {
+            case PInvoke.WM_PAINT:
+                Paint();
+                return default;
+            case PInvoke.WM_ERASEBKGND:
+                // Painting covers every pixel.
+                return new LRESULT(1);
+            case PInvoke.WM_LBUTTONDOWN or PInvoke.WM_LBUTTONDBLCLK:
+                PInvoke.SetCapture(Handle);
+                MouseDown(PointOf(lParam), message == PInvoke.WM_LBUTTONDBLCLK ? 2 : 1);
+                return default;
+            case PInvoke.WM_LBUTTONUP:
+                PInvoke.ReleaseCapture();
+                MouseUp(PointOf(lParam));
+                return default;
+            case PInvoke.WM_RBUTTONDOWN:
+                RightMouseDown(PointOf(lParam));
+                return default;
+            case PInvoke.WM_RBUTTONUP:
+                RightMouseUp(PointOf(lParam));
+                return default;
+            case PInvoke.WM_MOUSEMOVE:
+                MouseMove(PointOf(lParam), (wParam.Value & (nuint)MODIFIERKEYS_FLAGS.MK_LBUTTON) != 0);
+                return default;
+            case PInvoke.WM_MOUSELEAVE:
+                tracking = false;
+                mouse = null;
+                HideTip();
+                Invalidate();
+                return default;
+            case PInvoke.WM_MOUSEWHEEL:
+                Wheel((short)(wParam.Value >> 16 & 0xFFFF));
+                return default;
+            case PInvoke.WM_KEYDOWN or PInvoke.WM_SYSKEYDOWN:
+                if (KeyDown((uint)wParam.Value))
+                    return default;
+                // Keys left to Windows, such as Alt+F4.
+                break;
+            case PInvoke.WM_CHAR:
+                TypeCharacter((char)wParam.Value);
+                return default;
+            case PInvoke.WM_SYSCHAR:
+                // Alt with a letter picks a tool; without this, Windows would beep for a missing menu.
+                return default;
+            case PInvoke.WM_SETCURSOR when (lParam.Value & 0xFFFF) == PInvoke.HTCLIENT:
+                PInvoke.SetCursor(Cursor());
+                return new LRESULT(1);
+            case PInvoke.WM_TIMER:
+                PInvoke.KillTimer(Handle, wParam.Value);
+                if (wParam.Value == TipTimer)
+                    tip = hovered;
+                else
+                    sizeHint = false;
+                Invalidate();
+                return default;
+            case PInvoke.WM_CLOSE:
+                // Alt+F4 or a close request from another app closes all the overlays, like Esc.
+                onClose();
+                return default;
+            case PInvoke.WM_DPICHANGED:
+                // The overlay stays on its display; the suggested size doesn't apply.
+                return default;
+            case PInvoke.WM_NCDESTROY:
+                screenshot.Dispose();
+                dimmed.Dispose();
+                frame.Dispose();
+                break;
+        }
+        return Default(message, wParam, lParam);
+    }
 
     // MARK: - Drawing
 
-    protected override void OnPaint(PaintEventArgs e)
+    private void Paint()
     {
-        if (frame?.Width != ClientSize.Width || frame.Height != ClientSize.Height)
+        using (var canvas = new Canvas(frame))
         {
-            frame?.Dispose();
-            frame = new SKBitmap(new SKImageInfo(ClientSize.Width, ClientSize.Height, SKColorType.Bgra8888, SKAlphaType.Premul));
-        }
-        using (var canvas = new SKCanvas(frame))
-        {
-            var clip = e.ClipRectangle;
-            canvas.ClipRect(SKRect.Create(clip.X, clip.Y, clip.Width, clip.Height));
-            canvas.Scale(PixelScale);
+            canvas.Scale(scale, scale);
             Draw(canvas);
         }
-        // Copy the frame to the window as a top-down 32-bit bitmap.
-        var header = new BitmapInfoHeader { Size = Marshal.SizeOf<BitmapInfoHeader>(), Width = frame.Width, Height = -frame.Height, Planes = 1, BitCount = 32 };
-        var hdc = e.Graphics.GetHdc();
-        try
-        {
-            StretchDIBits(hdc, 0, 0, frame.Width, frame.Height, 0, 0, frame.Width, frame.Height, frame.GetPixels(), header, 0, 0x00CC0020);
-        }
-        finally
-        {
-            e.Graphics.ReleaseHdc(hdc);
-        }
+        var header = frame.Header;
+        var hdc = PInvoke.BeginPaint(Handle, out var paint);
+        PInvoke.StretchDIBits(hdc, 0, 0, frame.Width, frame.Height, 0, 0, frame.Width, frame.Height, frame.Data, &header, DIB_USAGE.DIB_RGB_COLORS, ROP_CODE.SRCCOPY);
+        PInvoke.EndPaint(Handle, in paint);
     }
 
-    private void Draw(SKCanvas canvas)
+    private void Draw(Canvas canvas)
     {
-        canvas.DrawImage(dimmed, Area, Nearest);
+        canvas.Copy(dimmed, Area);
         if (selection is not { } sel)
             return;
 
-        canvas.Save();
+        var state = canvas.Save();
         canvas.ClipRect(sel);
-        canvas.DrawImage(screenshot, Area, Nearest);
+        canvas.Copy(screenshot, sel);
         for (var i = 0; i < annotations.Count; i++)
         {
             if (i != editing)
                 annotations[i].Draw(canvas);
         }
         current?.Draw(canvas);
-        canvas.Restore();
+        canvas.Restore(state);
 
         DrawFrame(canvas, sel);
         if (selected is { } s)
         {
             // Selected object: an accent-colored dashed frame over a white underlay.
-            var box = SKRect.Inflate(annotations[s].Bounds, 3, 3);
-            using var paint = new SKPaint { IsAntialias = true, IsStroke = true, StrokeWidth = 2, Color = SKColors.White };
-            canvas.DrawRoundRect(box, 3, 3, paint);
-            paint.PathEffect = ObjectDash;
-            paint.Color = Accent;
-            canvas.DrawRoundRect(box, 3, 3, paint);
+            var box = RectangleF.Inflate(annotations[s].Bounds, 3, 3);
+            canvas.StrokeRoundRect(box, 3, White, 2);
+            canvas.StrokeRoundRect(box, 3, accent, 2, ObjectDash);
         }
         DrawMousePreview(canvas);
         DrawSizeHint(canvas);
         DrawPicker(canvas);
         DrawBars(canvas);
         DrawEditor(canvas);
+        DrawTip(canvas);
     }
 
-    private void DrawFrame(SKCanvas canvas, SKRect sel)
+    private void DrawFrame(Canvas canvas, RectangleF sel)
     {
         // A whole number of pixels wide, so the frame stays crisp at any display scale.
-        var line = MathF.Max(1, MathF.Round(PixelScale)) / PixelScale;
-        var border = SKRect.Inflate(sel, line / 2, line / 2);
-        using var paint = new SKPaint { IsStroke = true, StrokeWidth = line, Color = SKColors.Black };
-        canvas.DrawRect(border, paint);
-        paint.PathEffect = FrameDash;
-        paint.Color = SKColors.White;
-        canvas.DrawRect(border, paint);
-        paint.PathEffect = null;
+        var line = MathF.Max(1, MathF.Round(scale)) / scale;
+        var border = RectangleF.Inflate(sel, line / 2, line / 2);
+        canvas.StrokeRect(border, Black, line);
+        canvas.StrokeRect(border, White, line, FrameDash);
         foreach (var (dx, dy) in Handles)
         {
             var p = HandlePoint(dx, dy, sel);
-            var handle = SKRect.Create(p.X - 3, p.Y - 3, 6, 6);
-            paint.IsStroke = false;
-            paint.Color = SKColors.White;
-            canvas.DrawRect(handle, paint);
-            paint.IsStroke = true;
-            paint.Color = SKColors.Black;
-            canvas.DrawRect(handle, paint);
+            var handle = new RectangleF(p.X - 3, p.Y - 3, 6, 6);
+            canvas.FillRect(handle, White);
+            canvas.StrokeRect(handle, Black, line);
         }
 
-        var label = $"{MathF.Round(sel.Width * PixelScale)} × {MathF.Round(sel.Height * PixelScale)}";
-        using var font = new SKFont(Annotation.Medium, 11);
-        var size = new SKSize(font.MeasureText(label), font.Spacing);
-        var box = SKRect.Create(sel.Left, sel.Top - size.Height - 8, size.Width + 8, size.Height + 4);
+        var font = Font.Get(11);
+        var label = $"{MathF.Round(sel.Width * scale)} × {MathF.Round(sel.Height * scale)}";
+        var size = new Vector2(font.Width(label), font.LineHeight);
+        var box = new RectangleF(sel.Left, sel.Top - size.Y - 8, size.X + 8, size.Y + 4);
         if (box.Top < 0)
-            box.Location = new SKPoint(sel.Left + 4, sel.Top + 4);
-        paint.IsStroke = false;
-        paint.IsAntialias = true;
-        paint.Color = new SKColor(0, 0, 0, 179);
-        canvas.DrawRoundRect(box, 3, 3, paint);
-        paint.Color = SKColors.White;
-        canvas.DrawTextAt(label, new SKPoint(box.Left + 4, box.Top + 2), font, paint);
+            box = new RectangleF(sel.Left + 4, sel.Top + 4, box.Width, box.Height);
+        canvas.FillRoundRect(box, 3, 0xB3000000);
+        canvas.Text(label, new Vector2(box.Left + 4, box.Top + 2), font, White);
     }
 
     /// Brush preview under the cursor: tool color and width; for numbering, a circle with the next number.
-    private void DrawMousePreview(SKCanvas canvas)
+    private void DrawMousePreview(Canvas canvas)
     {
-        if (tool is not { } t || mouse is not { } m || drag != null || picker != null || editor != null || selection?.Contains(m) != true)
+        if (tool is not { } t || mouse is not { } m || drag != null || picker != null || editor != null || selection?.Contains(m.X, m.Y) != true)
             return;
         float size = SizeOf(t);
         var diameter = t switch
         {
             Tool.Text or Tool.Pixelate or Tool.Invert or Tool.FilledRect => 0,
             Tool.Counter => 2 * size,
-            _ => Math.Max(size, 3),
+            _ => MathF.Max(size, 3),
         };
         if (diameter <= 0)
             return;
-        using var paint = new SKPaint { IsAntialias = true, Color = t is Tool.Marker or Tool.Counter ? color.WithAlpha(102) : color };
-        canvas.DrawCircle(m, diameter / 2, paint);
+        canvas.FillEllipse(Annotation.Circle(m, diameter / 2), t is Tool.Marker or Tool.Counter ? 0x66000000 | (color & 0xFFFFFF) : color);
         if (t == Tool.Counter)
         {
-            using var font = new SKFont(Annotation.Bold, size);
-            paint.Color = SKColors.White;
-            canvas.DrawCenteredText($"{counter}", m, font, paint);
+            var font = Font.Get(size, bold: true);
+            var label = $"{counter}";
+            canvas.Text(label, m - new Vector2(font.Width(label), font.LineHeight) / 2, font, White);
         }
     }
 
     /// After scrolling the wheel, the current size is briefly shown next to the cursor.
-    private void DrawSizeHint(SKCanvas canvas)
+    private void DrawSizeHint(Canvas canvas)
     {
-        if (DateTime.Now >= sizeHintUntil || mouse is not { } m)
+        if (!sizeHint || mouse is not { } m)
             return;
         int? value = editor != null ? editorSize : selected is { } i ? annotations[i].Size : tool is { } t ? SizeOf(t) : null;
         if (value == null)
             return;
+        var font = Font.Get(13, bold: true);
         var label = $"{value}";
-        using var font = new SKFont(Annotation.Bold, 13);
-        var size = new SKSize(font.MeasureText(label), font.Spacing);
-        var badge = SKRect.Create(m.X + 16, m.Y + 16, size.Width + 14, size.Height + 6);
-        using var paint = new SKPaint { IsAntialias = true, Color = new SKColor(38, 38, 38, 191) };
-        canvas.DrawRoundRect(badge, badge.Height / 2, badge.Height / 2, paint);
-        paint.Color = SKColors.White;
-        canvas.DrawTextAt(label, new SKPoint(badge.MidX - size.Width / 2, badge.MidY - size.Height / 2), font, paint);
+        var size = new Vector2(font.Width(label), font.LineHeight);
+        var badge = new RectangleF(m.X + 16, m.Y + 16, size.X + 14, size.Y + 6);
+        canvas.FillRoundRect(badge, badge.Height / 2, 0xBF262626);
+        canvas.Text(label, new Vector2(badge.X + 7, badge.Y + 3), font, White);
     }
 
     /// Color ring around the point where it was opened; the highlighted color is enlarged and outlined in white.
-    private void DrawPicker(SKCanvas canvas)
+    private void DrawPicker(Canvas canvas)
     {
         if (picker is not { } open)
             return;
-        using var paint = new SKPaint { IsAntialias = true };
         for (var i = 0; i < Palette.Length; i++)
         {
             var isHovered = i == open.Hovered;
-            var swatch = SKRect.Inflate(SwatchRect(i, open.Center), isHovered ? 3 : 0, isHovered ? 3 : 0);
-            paint.IsStroke = false;
-            paint.Color = Palette[i];
-            canvas.DrawOval(swatch, paint);
-            paint.IsStroke = true;
-            paint.StrokeWidth = isHovered ? 3 : 1;
-            paint.Color = isHovered ? SKColors.White : new SKColor(0, 0, 0, 128);
-            canvas.DrawOval(swatch, paint);
+            var swatch = RectangleF.Inflate(SwatchRect(i, open.Center), isHovered ? 3 : 0, isHovered ? 3 : 0);
+            canvas.FillEllipse(swatch, Palette[i]);
+            canvas.StrokeEllipse(swatch, isHovered ? White : 0x80000000, isHovered ? 3 : 1);
         }
     }
 
     /// Frame of swatch i, going clockwise from the top of the ring.
-    private static SKRect SwatchRect(int i, SKPoint center)
+    private static RectangleF SwatchRect(int i, Vector2 center)
     {
         var angle = 2 * MathF.PI * i / Palette.Length - MathF.PI / 2;
-        const float r = 13;
-        return SKRect.Create(center.X + RingRadius * MathF.Cos(angle) - r, center.Y + RingRadius * MathF.Sin(angle) - r, 2 * r, 2 * r);
+        return Annotation.Circle(center + RingRadius * new Vector2(MathF.Cos(angle), MathF.Sin(angle)), 13);
     }
 
-    private static int? SwatchAt(SKPoint center, SKPoint p)
+    private static int? SwatchAt(Vector2 center, Vector2 p)
     {
         for (var i = 0; i < Palette.Length; i++)
         {
-            if (SwatchRect(i, center).Contains(p))
+            if (SwatchRect(i, center).Contains(p.X, p.Y))
                 return i;
         }
         return null;
     }
 
     /// The text being typed with its caret, or with a highlight while all of it is selected.
-    private void DrawEditor(SKCanvas canvas)
+    private void DrawEditor(Canvas canvas)
     {
         if (editor is not { } e)
             return;
-        using var font = Annotation.TextFont(editorSize);
-        using var paint = new SKPaint { IsAntialias = true, Color = new SKColor(0xB3, 0xD7, 0xFF) };
+        var font = Font.Get(editorSize);
         var lines = e.Text.Split('\n');
         if (e.AllSelected)
         {
             for (var i = 0; i < lines.Length; i++)
-                canvas.DrawRect(SKRect.Create(e.Origin.X + 4, e.Origin.Y + 4 + i * font.Spacing, font.MeasureText(lines[i]), font.Spacing), paint);
+                canvas.FillRect(new RectangleF(e.Origin.X + 4, e.Origin.Y + 4 + i * font.LineHeight, font.Width(lines[i]), font.LineHeight), 0xFFB3D7FF);
         }
         new Annotation(Tool.Text, e.Color, editorSize, [e.Origin]) { Text = e.Text }.Draw(canvas);
         if (!e.AllSelected)
         {
             var before = e.Text[..e.Caret];
-            var x = e.Origin.X + 4 + font.MeasureText(before[(before.LastIndexOf('\n') + 1)..]);
-            var y = e.Origin.Y + 4 + before.Count(c => c == '\n') * font.Spacing;
-            paint.Color = e.Color;
-            paint.StrokeWidth = 1;
-            canvas.DrawLine(x, y, x, y + font.Spacing, paint);
+            var x = e.Origin.X + 4 + font.Width(before[(before.LastIndexOf('\n') + 1)..]);
+            var y = e.Origin.Y + 4 + before.AsSpan().Count('\n') * font.LineHeight;
+            canvas.Line(new Vector2(x, y), new Vector2(x, y + font.LineHeight), e.Color, 1);
         }
+    }
+
+    /// A button's hint, shown once the cursor rests on the button.
+    private void DrawTip(Canvas canvas)
+    {
+        if (tip is not { } button || mouse is not { } m)
+            return;
+        var font = Font.Get(12);
+        var size = new Vector2(font.Width(button.Tip) + 12, font.LineHeight + 6);
+        var area = Area;
+        var box = new RectangleF(MathF.Min(m.X + 12, area.Right - size.X), MathF.Min(m.Y + 22, area.Bottom - size.Y), size.X, size.Y);
+        canvas.FillRoundRect(box, 4, White);
+        canvas.StrokeRoundRect(box, 4, 0xFFA0A0A0, 1);
+        canvas.Text(button.Tip, new Vector2(box.X + 6, box.Y + 3), font, 0xFF1A1A1A);
     }
 
     // MARK: - Mouse
 
-    protected override void OnMouseDown(MouseEventArgs e)
+    private void MouseDown(Vector2 p, int clicks)
     {
-        Focus();
-        var p = PointOf(e);
         mouse = p;
         HideTip();
-        if (e.Button == MouseButtons.Left)
-            LeftMouseDown(p, e.Clicks);
-        else if (e.Button == MouseButtons.Right)
-            RightMouseDown(p);
-        UpdateCursor();
+        LeftMouseDown(p, clicks);
         Invalidate();
     }
 
-    private void LeftMouseDown(SKPoint p, int clicks)
+    private void LeftMouseDown(Vector2 p, int clicks)
     {
         if (InBars(p))
         {
@@ -380,20 +417,20 @@ sealed partial class CaptureView : Control
             drag = new Selecting(p);
             return;
         }
-        var handle = Array.FindIndex(Handles, h => SKPoint.Distance(HandlePoint(h.Dx, h.Dy, sel), p) <= 6);
+        var handle = Array.FindIndex(Handles, h => Vector2.Distance(HandlePoint(h.Dx, h.Dy, sel), p) <= 6);
         if (handle >= 0)
         {
             selected = null;
             drag = new Resizing(Handles[handle].Dx, Handles[handle].Dy, sel);
         }
-        else if (sel.Contains(p))
+        else if (sel.Contains(p.X, p.Y))
         {
             if (tool is { } t)
             {
                 // With a tool active, a click always starts a new object.
                 StartDrawing(t, p);
             }
-            else if ((selected is { } o && annotations[o].Bounds.Contains(p) ? o : Hit(p)) is { } i)
+            else if ((selected is { } o && annotations[o].Bounds.Contains(p.X, p.Y) ? o : Hit(p)) is { } i)
             {
                 SelectObject(i);
                 drag = new MovingObject(p, [.. annotations]);
@@ -414,17 +451,22 @@ sealed partial class CaptureView : Control
         }
     }
 
-    protected override void OnMouseMove(MouseEventArgs e)
+    private void MouseMove(Vector2 p, bool leftButton)
     {
-        var p = PointOf(e);
         mouse = p;
-        if (e.Button == MouseButtons.Left && drag != null)
+        if (!tracking)
+        {
+            // Ask for WM_MOUSELEAVE when the cursor leaves the display.
+            var track = new TRACKMOUSEEVENT { cbSize = (uint)sizeof(TRACKMOUSEEVENT), dwFlags = TRACKMOUSEEVENT_FLAGS.TME_LEAVE, hwndTrack = Handle };
+            tracking = PInvoke.TrackMouseEvent(&track);
+        }
+        if (leftButton && drag != null)
             MouseDragged(p);
         else
             MouseMoved(p);
     }
 
-    private void MouseDragged(SKPoint p)
+    private void MouseDragged(Vector2 p)
     {
         switch (drag)
         {
@@ -433,15 +475,15 @@ sealed partial class CaptureView : Control
                 break;
             case MovingSelection(var start, var original):
             {
-                var r = original;
-                r.Offset(Snap(p.X - start.X), Snap(p.Y - start.Y));
-                r.Location = new SKPoint(Math.Min(Math.Max(r.Left, 0), Area.Right - r.Width), Math.Min(Math.Max(r.Top, 0), Area.Bottom - r.Height));
-                selection = r;
+                var area = Area;
+                var x = MathF.Min(MathF.Max(original.X + Snap(p.X - start.X), 0), area.Right - original.Width);
+                var y = MathF.Min(MathF.Max(original.Y + Snap(p.Y - start.Y), 0), area.Bottom - original.Height);
+                selection = new RectangleF(x, y, original.Width, original.Height);
                 break;
             }
             case Resizing(var dx, var dy, var r):
             {
-                SKPoint a = new(r.Left, r.Top), b = new(r.Right, r.Bottom);
+                Vector2 a = new(r.Left, r.Top), b = new(r.Right, r.Bottom);
                 if (dx < 0)
                     a.X = p.X;
                 else if (dx > 0)
@@ -461,7 +503,7 @@ sealed partial class CaptureView : Control
                 else
                 {
                     var v = p - a.Start;
-                    var d = ModifierKeys.HasFlag(Keys.Shift) ? a.Tool.Constrained(v) : v;
+                    var d = Pressed(VIRTUAL_KEY.VK_SHIFT) ? a.Tool.Constrained(v) : v;
                     current = Refreshed(a with { Points = [a.Start, a.Start + d] });
                 }
                 break;
@@ -474,14 +516,8 @@ sealed partial class CaptureView : Control
         Invalidate();
     }
 
-    protected override void OnMouseUp(MouseEventArgs e)
+    private void MouseUp(Vector2 p)
     {
-        var p = PointOf(e);
-        if (e.Button == MouseButtons.Right)
-        {
-            RightMouseUp(p);
-            return;
-        }
         var finished = drag;
         drag = null;
         switch (finished)
@@ -506,39 +542,32 @@ sealed partial class CaptureView : Control
                     selection = null;
                 break;
         }
-        UpdateCursor();
         Invalidate();
     }
 
-    private void MouseMoved(SKPoint p)
+    private void MouseMoved(Vector2 p)
     {
-        UpdateCursor();
         if (picker is { } open && SwatchAt(open.Center, p) is { } i)
             picker = open with { Hovered = i };
         UpdateTip(p);
-        if (tool != null || picker != null)
+        if (tool != null || picker != null || tip != null)
             Invalidate();
     }
 
-    protected override void OnMouseLeave(EventArgs e)
-    {
-        mouse = null;
-        HideTip();
-        Invalidate();
-    }
-
     /// Right click opens the color ring; with no tool active it first selects the object under the cursor so it can be recolored.
-    private void RightMouseDown(SKPoint p)
+    private void RightMouseDown(Vector2 p)
     {
+        HideTip();
         if (editor != null)
             return;
         if (tool == null && Hit(p) is { } i)
             SelectObject(i);
         picker = (p, IndexOf(color));
+        Invalidate();
     }
 
     /// Besides clicking a color, you can press the right button, drag to a color and release.
-    private void RightMouseUp(SKPoint p)
+    private void RightMouseUp(Vector2 p)
     {
         if (picker is { } open && SwatchAt(open.Center, p) is { } i)
         {
@@ -550,16 +579,17 @@ sealed partial class CaptureView : Control
 
     /// The mouse wheel changes the size of the current tool, the selected object or the text being typed, within 1...72;
     /// Shift + wheel with the numbering tool changes the next number.
-    protected override void OnMouseWheel(MouseEventArgs e)
+    private void Wheel(int delta)
     {
         // Touchpads send a stream of small deltas: accumulate them, one size step per wheel notch.
-        wheel += e.Delta;
-        var step = wheel / SystemInformation.MouseWheelScrollDelta;
-        wheel -= step * SystemInformation.MouseWheelScrollDelta;
+        const int notch = 120;
+        wheel += delta;
+        var step = wheel / notch;
+        wheel -= step * notch;
         if (step == 0)
             return;
 
-        if (tool == Tool.Counter && ModifierKeys.HasFlag(Keys.Shift))
+        if (tool == Tool.Counter && Pressed(VIRTUAL_KEY.VK_SHIFT))
         {
             counter = Math.Clamp(counter + step, 1, 999);
         }
@@ -585,80 +615,67 @@ sealed partial class CaptureView : Control
         {
             return;
         }
-        sizeHintUntil = DateTime.Now.AddSeconds(0.8);
-        HideSizeHintLater();
-        Invalidate();
-    }
-
-    private async void HideSizeHintLater()
-    {
-        await Task.Delay(850);
+        sizeHint = true;
+        PInvoke.SetTimer(Handle, HintTimer, 800, null);
         Invalidate();
     }
 
     // MARK: - Keyboard
 
-    /// Arrows, Tab, Enter and Esc come to OnKeyDown instead of moving the focus.
-    protected override bool IsInputKey(Keys keyData) => true;
-
-    protected override void OnKeyDown(KeyEventArgs e)
+    /// Returns false for keys left to Windows, such as Alt+F4.
+    private bool KeyDown(uint key)
     {
         HideTip();
+        bool control = Pressed(VIRTUAL_KEY.VK_CONTROL), alt = Pressed(VIRTUAL_KEY.VK_MENU);
         // AltGr is reported as Ctrl+Alt and types characters, so it isn't a command.
-        if (e.Control && !e.Alt)
-            Command(e.KeyCode, e.Shift);
-        else if (editor != null)
-            EditText(e.KeyCode);
-        else
-            Key(e.KeyCode);
+        var handled = control && !alt ? Command(key, Pressed(VIRTUAL_KEY.VK_SHIFT)) : editor != null ? EditText(key) : Key(key);
         Invalidate();
+        return handled;
     }
 
     /// Ctrl shortcuts; they work while typing text too.
-    private void Command(Keys key, bool shift)
+    private bool Command(uint key, bool shift)
     {
         switch (key)
         {
-            case Keys.C:
+            case 'C':
                 CopyImage();
                 break;
-            case Keys.S:
+            case 'S':
                 SaveImage();
                 break;
-            case Keys.Z when shift:
-            case Keys.Y:
+            case 'Z' when shift:
+            case 'Y':
                 Redo();
                 break;
-            case Keys.Z:
+            case 'Z':
                 Undo();
                 break;
-            case Keys.Enter when editor != null:
+            case (uint)VIRTUAL_KEY.VK_RETURN when editor != null:
                 CommitText();
                 break;
-            case Keys.Enter:
+            case (uint)VIRTUAL_KEY.VK_RETURN:
                 CopyImage();
                 break;
-            case Keys.V when editor != null:
-                try
-                {
-                    Insert(Clipboard.GetText().ReplaceLineEndings("\n"));
-                }
-                catch (ExternalException)
-                {
-                    // Another app holds the clipboard, so there is nothing to paste this time.
-                }
+            case 'V' when editor != null:
+                // Nothing to paste while another app holds the clipboard.
+                if (Clipboard.GetText(App.Current.Handle) is { } text)
+                    Insert(text.ReplaceLineEndings("\n"));
                 break;
-            case Keys.A when editor != null:
+            case 'A' when editor != null:
                 editor.AllSelected = true;
                 break;
+            default:
+                return false;
         }
+        return true;
     }
 
-    private void Key(Keys key)
+    private bool Key(uint key)
     {
         switch (key)
         {
-            case Keys.Escape:
+            case (uint)VIRTUAL_KEY.VK_ESCAPE:
                 // Esc works in steps: close the color ring, drop the tool, deselect the object, and only then quit.
                 if (picker != null)
                     picker = null;
@@ -668,30 +685,32 @@ sealed partial class CaptureView : Control
                     selected = null;
                 else
                     onClose();
-                break;
-            case Keys.Enter:
+                return true;
+            case (uint)VIRTUAL_KEY.VK_RETURN:
                 CopyImage();
-                break;
-            case Keys.Back or Keys.Delete:
+                return true;
+            case (uint)VIRTUAL_KEY.VK_BACK or (uint)VIRTUAL_KEY.VK_DELETE:
                 DeleteSelected();
-                break;
-            case Keys.V:
+                return true;
+            case 'V':
                 SelectMoveMode();
-                break;
-            default:
-                foreach (var t in Enum.GetValues<Tool>())
-                {
-                    if (t.Key == (char)key)
-                        SelectTool(t);
-                }
-                break;
+                return true;
         }
+        for (var t = Tool.Pencil; t <= Tool.Invert; t++)
+        {
+            if (t.Key == key)
+            {
+                SelectTool(t);
+                return true;
+            }
+        }
+        return false;
     }
 
     // MARK: - Text
 
     /// Text is typed right on the screenshot: Enter adds a line; Esc, Ctrl+Enter or a click elsewhere finishes.
-    private void BeginText(SKPoint p, int? index = null)
+    private void BeginText(Vector2 p, int? index = null)
     {
         var source = index is { } i ? annotations[i] : null;
         editorSize = source?.Size ?? SizeOf(Tool.Text);
@@ -701,43 +720,47 @@ sealed partial class CaptureView : Control
         Invalidate();
     }
 
-    private void EditText(Keys key)
+    private bool EditText(uint key)
     {
         var e = editor!;
         switch (key)
         {
-            case Keys.Escape:
+            case (uint)VIRTUAL_KEY.VK_ESCAPE:
                 CommitText();
                 break;
-            case Keys.Enter:
+            case (uint)VIRTUAL_KEY.VK_RETURN:
                 Insert("\n");
                 break;
-            case Keys.Back:
+            case (uint)VIRTUAL_KEY.VK_BACK:
                 Erase(e.Caret - 1);
                 break;
-            case Keys.Delete:
+            case (uint)VIRTUAL_KEY.VK_DELETE:
                 Erase(e.Caret);
                 break;
-            case Keys.Left:
+            case (uint)VIRTUAL_KEY.VK_LEFT:
                 MoveCaret(e.AllSelected ? 0 : e.Caret - 1);
                 break;
-            case Keys.Right:
+            case (uint)VIRTUAL_KEY.VK_RIGHT:
                 MoveCaret(e.AllSelected ? e.Text.Length : e.Caret + 1);
                 break;
-            case Keys.Home:
+            case (uint)VIRTUAL_KEY.VK_HOME:
                 MoveCaret(e.Caret == 0 ? 0 : e.Text.LastIndexOf('\n', e.Caret - 1) + 1);
                 break;
-            case Keys.End:
+            case (uint)VIRTUAL_KEY.VK_END:
                 MoveCaret(e.Text.IndexOf('\n', e.Caret) is var end and >= 0 ? end : e.Text.Length);
                 break;
+            default:
+                // Character keys come as WM_CHAR.
+                return false;
         }
+        return true;
     }
 
-    protected override void OnKeyPress(KeyPressEventArgs e)
+    private void TypeCharacter(char c)
     {
-        if (editor == null || char.IsControl(e.KeyChar))
+        if (editor == null || char.IsControl(c))
             return;
-        Insert(e.KeyChar.ToString());
+        Insert($"{c}");
         Invalidate();
     }
 
@@ -827,15 +850,22 @@ sealed partial class CaptureView : Control
     /// The color button opens the same ring as a right click, around the button and fully on screen.
     private void PickColor()
     {
-        var button = ButtonRects().First(b => b.Button.Icon == "Color").Rect;
+        var button = default(RectangleF);
+        foreach (var (b, rect) in ButtonRects())
+        {
+            if (b.Icon == null)
+                button = rect;
+        }
+        var area = Area;
         var margin = RingRadius + 20;
-        picker = (new SKPoint(Math.Min(Math.Max(button.MidX, margin), Area.Right - margin), Math.Min(Math.Max(button.MidY, margin), Area.Bottom - margin)),
-                  IndexOf(color));
+        var center = new Vector2(MathF.Min(MathF.Max(button.X + button.Width / 2, margin), area.Right - margin),
+                                 MathF.Min(MathF.Max(button.Y + button.Height / 2, margin), area.Bottom - margin));
+        picker = (center, IndexOf(color));
         Invalidate();
     }
 
     /// The new color applies to new objects, to the selected object (undoable) and to the text being typed.
-    private void Apply(SKColor newColor)
+    private void Apply(uint newColor)
     {
         color = newColor;
         if (editor != null)
@@ -868,7 +898,12 @@ sealed partial class CaptureView : Control
     {
         annotations = state;
         selected = null;
-        counter = annotations.Where(a => a.Tool == Tool.Counter).Select(a => a.Number).DefaultIfEmpty(0).Max() + 1;
+        counter = 1;
+        foreach (var a in annotations)
+        {
+            if (a.Tool == Tool.Counter)
+                counter = Math.Max(counter, a.Number + 1);
+        }
         Invalidate();
     }
 
@@ -900,17 +935,11 @@ sealed partial class CaptureView : Control
         if (RenderSelection() is not { } image)
             return;
         using (image)
-        using (var png = image.Encode(SKEncodedImageFormat.Png, 100))
-        using (var bitmap = new Bitmap(new MemoryStream(png.ToArray())))
         {
-            try
+            if (!Clipboard.SetImage(image, App.Current.Handle))
             {
-                Clipboard.SetImage(bitmap);
-            }
-            catch (ExternalException error)
-            {
-                // Another app holds the clipboard; the screenshot stays open, so it can be copied again.
-                MessageBox.Show(this, error.Message, "EasyShot", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                // The screenshot stays open, so it can be copied again.
+                PInvoke.MessageBox(Handle, "Буфер обмена занят другим приложением.", "EasyShot", MESSAGEBOX_STYLE.MB_ICONERROR);
                 return;
             }
         }
@@ -921,51 +950,33 @@ sealed partial class CaptureView : Control
     {
         if (RenderSelection() is not { } image)
             return;
-        byte[] png;
-        using (image)
-        using (var data = image.Encode(SKEncodedImageFormat.Png, 100))
-            png = data.ToArray();
         onClose();
-        SaveLater(png);
-    }
-
-    /// Shows the save dialog once the overlays have closed, otherwise it would end up behind them.
-    private static async void SaveLater(byte[] png)
-    {
-        await Task.Yield();
-        using var dialog = new SaveFileDialog { Filter = "PNG|*.png", FileName = $"Screenshot {DateTime.Now:yyyy-MM-dd HH.mm.ss}.png" };
-        if (dialog.ShowDialog() != DialogResult.OK)
-            return;
-        try
-        {
-            File.WriteAllBytes(dialog.FileName, png);
-        }
-        catch (Exception error)
-        {
-            MessageBox.Show(error.Message, "EasyShot", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+        App.Current.SaveLater(image);
     }
 
     /// Final image: pixels of the selected area plus the drawn objects.
-    private SKImage? RenderSelection()
+    private Pixels? RenderSelection()
     {
         CommitText();
         if (selection is not { } sel)
             return null;
-        var pixels = SKRectI.Round(new SKRect(sel.Left * PixelScale, sel.Top * PixelScale, sel.Right * PixelScale, sel.Bottom * PixelScale));
-        using var surface = SKSurface.Create(new SKImageInfo(pixels.Width, pixels.Height, SKColorType.Bgra8888, SKAlphaType.Opaque));
-        var canvas = surface.Canvas;
-        canvas.DrawImage(screenshot, pixels, SKRect.Create(pixels.Width, pixels.Height), Nearest);
-        // Objects are in points; map them to the area's pixels.
-        canvas.Scale(PixelScale);
-        canvas.Translate(-sel.Left, -sel.Top);
-        annotations.ForEach(a => a.Draw(canvas));
-        return surface.Snapshot();
+        int x0 = (int)MathF.Round(sel.Left * scale), y0 = (int)MathF.Round(sel.Top * scale);
+        var image = new Pixels((int)MathF.Round(sel.Right * scale) - x0, (int)MathF.Round(sel.Bottom * scale) - y0);
+        using (var canvas = new Canvas(image))
+        {
+            // Objects are in points; map them to the area's pixels.
+            canvas.Translate(-x0, -y0);
+            canvas.Scale(scale, scale);
+            canvas.Copy(screenshot, sel, x0, y0);
+            foreach (var a in annotations)
+                a.Draw(canvas);
+        }
+        return image;
     }
 
     // MARK: - Helpers
 
-    private void StartDrawing(Tool t, SKPoint p)
+    private void StartDrawing(Tool t, Vector2 p)
     {
         if (t == Tool.Text)
         {
@@ -978,7 +989,11 @@ sealed partial class CaptureView : Control
 
     private static int SizeOf(Tool t) => Sizes.GetValueOrDefault(t, t.DefaultSize);
 
-    private static int? IndexOf(SKColor c) => Array.IndexOf(Palette, c) is var i and >= 0 ? i : null;
+    private static int? IndexOf(uint c) => Array.IndexOf(Palette, c) is var i and >= 0 ? i : null;
+
+    private static int Clamp(int size) => Math.Clamp(size, MinSize, MaxSize);
+
+    private static bool Pressed(VIRTUAL_KEY key) => PInvoke.GetKeyState((int)key) < 0;
 
     private void Record(Action change)
     {
@@ -1002,7 +1017,7 @@ sealed partial class CaptureView : Control
     }
 
     /// Topmost object under the point.
-    private int? Hit(SKPoint p)
+    private int? Hit(Vector2 p)
     {
         for (var i = annotations.Count - 1; i >= 0; i--)
         {
@@ -1020,149 +1035,134 @@ sealed partial class CaptureView : Control
         var box = a.Box;
         return a with
         {
-            Pixelated = Pixelate.Image(screenshot, new SKRect(box.Left * PixelScale, box.Top * PixelScale, box.Right * PixelScale, box.Bottom * PixelScale),
-                                       (int)(a.Size * PixelScale)),
+            Pixelated = Pixelate.Image(screenshot, new RectangleF(box.X * scale, box.Y * scale, box.Width * scale, box.Height * scale), (int)(a.Size * scale)),
         };
     }
 
-    /// In selection mode, the move cursor over an object shows that it can be dragged.
-    private void UpdateCursor()
+    /// Arrow over the toolbars; in selection mode, the move cursor over an object shows that it can be dragged.
+    private HCURSOR Cursor()
     {
-        if (mouse is not { } m)
-            return;
-        Cursor = InBars(m) ? Cursors.Default
-            : drag is MovingObject || (tool == null && picker == null && editor == null && Hit(m) != null) ? Cursors.SizeAll
-            : Cursors.Cross;
+        var name = mouse is { } m && InBars(m) ? PInvoke.IDC_ARROW
+            : drag is MovingObject || (mouse is { } p && tool == null && picker == null && editor == null && Hit(p) != null) ? PInvoke.IDC_SIZEALL
+            : PInvoke.IDC_CROSS;
+        return PInvoke.LoadCursor(HINSTANCE.Null, name);
     }
 
-    private static int Clamp(int size) => Math.Clamp(size, MinSize, MaxSize);
-
-    private SKPoint PointOf(MouseEventArgs e) =>
-        new(Math.Min(Math.Max(e.X / PixelScale, 0), Area.Right), Math.Min(Math.Max(e.Y / PixelScale, 0), Area.Bottom));
+    private Vector2 PointOf(LPARAM lParam)
+    {
+        var area = Area;
+        float x = (short)(lParam.Value & 0xFFFF) / scale, y = (short)(lParam.Value >> 16 & 0xFFFF) / scale;
+        return new Vector2(Math.Clamp(x, 0, area.Right), Math.Clamp(y, 0, area.Bottom));
+    }
 
     /// Rounds a length in points to whole pixels.
-    private float Snap(float length) => MathF.Round(length * PixelScale) / PixelScale;
+    private float Snap(float length) => MathF.Round(length * scale) / scale;
 
     /// Rectangle between two points, with its edges on whole pixels.
-    private SKRect Rect(SKPoint a, SKPoint b)
-    {
-        var s = PixelScale;
-        return new SKRect(MathF.Floor(Math.Min(a.X, b.X) * s) / s, MathF.Floor(Math.Min(a.Y, b.Y) * s) / s,
-                          MathF.Ceiling(Math.Max(a.X, b.X) * s) / s, MathF.Ceiling(Math.Max(a.Y, b.Y) * s) / s);
-    }
+    private RectangleF Rect(Vector2 a, Vector2 b) =>
+        RectangleF.FromLTRB(MathF.Floor(MathF.Min(a.X, b.X) * scale) / scale, MathF.Floor(MathF.Min(a.Y, b.Y) * scale) / scale,
+                            MathF.Ceiling(MathF.Max(a.X, b.X) * scale) / scale, MathF.Ceiling(MathF.Max(a.Y, b.Y) * scale) / scale);
 
-    private static SKPoint HandlePoint(int dx, int dy, SKRect r) =>
-        new(dx < 0 ? r.Left : dx > 0 ? r.Right : r.MidX, dy < 0 ? r.Top : dy > 0 ? r.Bottom : r.MidY);
+    private static Vector2 HandlePoint(int dx, int dy, RectangleF r) =>
+        new(dx < 0 ? r.Left : dx > 0 ? r.Right : r.X + r.Width / 2, dy < 0 ? r.Top : dy > 0 ? r.Bottom : r.Y + r.Height / 2);
 
     // MARK: - Toolbars
 
     /// Toolbar frames: tools go to the right of the frame and actions below it; near screen edges the toolbars move inside.
     /// The toolbars are hidden while selecting or drawing so they don't get in the way, and while the color ring is open so they don't cover it.
-    private (SKRect Tools, SKRect Actions)? Bars()
+    private (RectangleF Tools, RectangleF Actions)? Bars()
     {
         if (selection is not { } sel || picker != null || drag is Selecting or Drawing)
             return null;
         var area = Area;
-        var toolsSize = new SKSize(ButtonSize + 2 * BarInset, toolsBar.Length * ButtonSize + 2 * BarInset);
-        var actionsSize = new SKSize(actionsBar.Length * ButtonSize + 2 * BarInset, ButtonSize + 2 * BarInset);
+        float toolsWidth = ButtonSize + 2 * BarInset, toolsHeight = toolsBar.Length * ButtonSize + 2 * BarInset;
+        float actionsWidth = actionsBar.Length * ButtonSize + 2 * BarInset, actionsHeight = ButtonSize + 2 * BarInset;
         var x = sel.Right + 6;
-        if (x + toolsSize.Width > area.Right)
-            x = sel.Left - 6 - toolsSize.Width;
+        if (x + toolsWidth > area.Right)
+            x = sel.Left - 6 - toolsWidth;
         if (x < 0)
-            x = sel.Right - toolsSize.Width - 6;
-        var y = Math.Min(Math.Max(sel.Bottom - toolsSize.Height, 0), area.Bottom - toolsSize.Height);
-        var tools = SKRect.Create(new SKPoint(x, y), toolsSize);
+            x = sel.Right - toolsWidth - 6;
+        var y = MathF.Min(MathF.Max(sel.Bottom - toolsHeight, 0), area.Bottom - toolsHeight);
+        var tools = new RectangleF(x, y, toolsWidth, toolsHeight);
 
-        var actions = SKRect.Create(new SKPoint(Math.Max(sel.Right - actionsSize.Width, 0), sel.Bottom + 6), actionsSize);
+        var actions = new RectangleF(MathF.Max(sel.Right - actionsWidth, 0), sel.Bottom + 6, actionsWidth, actionsHeight);
         if (actions.Bottom > area.Bottom)
-            actions.Location = new SKPoint(actions.Left, sel.Bottom - actionsSize.Height - 6);
+            actions.Y = sel.Bottom - actionsHeight - 6;
         if (actions.IntersectsWith(tools))
-            actions.Location = new SKPoint(tools.Left - actionsSize.Width - 6, actions.Top);
+            actions.X = tools.Left - actionsWidth - 6;
         return (tools, actions);
     }
 
     /// The buttons with their frames, while the toolbars are shown.
-    private IEnumerable<(BarButton Button, SKRect Rect)> ButtonRects()
+    private IEnumerable<(BarButton Button, RectangleF Rect)> ButtonRects()
     {
         if (Bars() is not { } bars)
             yield break;
         for (var i = 0; i < toolsBar.Length; i++)
-            yield return (toolsBar[i], SKRect.Create(bars.Tools.Left + BarInset, bars.Tools.Top + BarInset + i * ButtonSize, ButtonSize, ButtonSize));
+            yield return (toolsBar[i], new RectangleF(bars.Tools.Left + BarInset, bars.Tools.Top + BarInset + i * ButtonSize, ButtonSize, ButtonSize));
         for (var i = 0; i < actionsBar.Length; i++)
-            yield return (actionsBar[i], SKRect.Create(bars.Actions.Left + BarInset + i * ButtonSize, bars.Actions.Top + BarInset, ButtonSize, ButtonSize));
+            yield return (actionsBar[i], new RectangleF(bars.Actions.Left + BarInset + i * ButtonSize, bars.Actions.Top + BarInset, ButtonSize, ButtonSize));
     }
 
-    private bool InBars(SKPoint p) => Bars() is { } bars && (bars.Tools.Contains(p) || bars.Actions.Contains(p));
+    private bool InBars(Vector2 p) => Bars() is { } bars && (bars.Tools.Contains(p.X, p.Y) || bars.Actions.Contains(p.X, p.Y));
 
-    private BarButton? ButtonAt(SKPoint p) => ButtonRects().FirstOrDefault(b => b.Rect.Contains(p)).Button;
+    private BarButton? ButtonAt(Vector2 p)
+    {
+        foreach (var (button, rect) in ButtonRects())
+        {
+            if (rect.Contains(p.X, p.Y))
+                return button;
+        }
+        return null;
+    }
 
-    private void DrawBars(SKCanvas canvas)
+    private void DrawBars(Canvas canvas)
     {
         if (Bars() is not { } bars)
             return;
-        using var paint = new SKPaint { IsAntialias = true, Color = new SKColor(247, 247, 247) };
-        canvas.DrawRoundRect(bars.Tools, 6, 6, paint);
-        canvas.DrawRoundRect(bars.Actions, 6, 6, paint);
-        paint.Color = new SKColor(0, 0, 0, 20);
+        canvas.FillRoundRect(bars.Tools, 6, BarColor);
+        canvas.FillRoundRect(bars.Actions, 6, BarColor);
         foreach (var (button, rect) in ButtonRects())
         {
+            var background = BarColor;
             if (button == hovered)
-                canvas.DrawRoundRect(SKRect.Inflate(rect, -2, -2), 4, 4, paint);
-            var icon = SKRect.Create(rect.MidX - 9, rect.MidY - 9, 18, 18);
-            if (button.Icon == "Color")
-                DrawSwatch(canvas, icon);
+            {
+                canvas.FillRoundRect(RectangleF.Inflate(rect, -2, -2), 4, HoverColor);
+                // The same gray as the highlight over the toolbar, for the digit cut out of the numbering icon.
+                background = 0xFFE4E4E4;
+            }
+            var icon = new RectangleF(rect.X + rect.Width / 2 - 9, rect.Y + rect.Height / 2 - 9, 18, 18);
+            if (button.Icon is { } i)
+                Icons.Draw(canvas, i, icon, button.Active?.Invoke() == true ? accent : Gray, background);
             else
-                Icons.Draw(canvas, button.Icon, icon, button.Active?.Invoke() == true ? Accent : Gray);
+                DrawSwatch(canvas, icon);
         }
     }
 
     /// The current color on the color button.
-    private static void DrawSwatch(SKCanvas canvas, SKRect rect)
+    private static void DrawSwatch(Canvas canvas, RectangleF rect)
     {
-        var swatch = SKRect.Inflate(rect, -2, -2);
-        using var paint = new SKPaint { IsAntialias = true, Color = color };
-        canvas.DrawOval(swatch, paint);
-        paint.IsStroke = true;
-        paint.StrokeWidth = 1;
-        paint.Color = new SKColor(128, 128, 128);
-        canvas.DrawOval(swatch, paint);
+        var swatch = RectangleF.Inflate(rect, -2, -2);
+        canvas.FillEllipse(swatch, color);
+        canvas.StrokeEllipse(swatch, 0xFF808080, 1);
     }
 
-    /// A button's hint shows up once the cursor rests on it.
-    private async void UpdateTip(SKPoint p)
+    /// A button's hint appears once the cursor has rested on it for a moment.
+    private void UpdateTip(Vector2 p)
     {
         var button = ButtonAt(p);
         if (button == hovered)
             return;
         HideTip();
         hovered = button;
+        if (button != null)
+            PInvoke.SetTimer(Handle, TipTimer, 600, null);
         Invalidate();
-        if (button == null)
-            return;
-        await Task.Delay(600);
-        if (hovered == button && mouse is { } m && !IsDisposed && Visible)
-            tip.Show(button.Tip, this, (int)(m.X * PixelScale), (int)((m.Y + 24) * PixelScale));
     }
 
     private void HideTip()
     {
-        hovered = null;
-        // Show makes the whole view a tooltip tool, and Hide alone would keep it, bringing the last hint back on any pause over the view.
-        tip.SetToolTip(this, null);
-        tip.Hide(this);
+        hovered = tip = null;
+        PInvoke.KillTimer(Handle, TipTimer);
     }
-
-    // MARK: - Win32
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct BitmapInfoHeader
-    {
-        public int Size, Width, Height;
-        public short Planes, BitCount;
-        public int Compression, SizeImage, XPelsPerMeter, YPelsPerMeter, ColorsUsed, ColorsImportant;
-    }
-
-    [LibraryImport("gdi32.dll")]
-    private static partial int StretchDIBits(nint hdc, int x, int y, int width, int height, int sourceX, int sourceY, int sourceWidth, int sourceHeight,
-                                             nint bits, in BitmapInfoHeader header, uint usage, uint operation);
 }
