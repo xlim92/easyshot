@@ -32,7 +32,7 @@ Press the hotkey, then drag to select an area. The tools appear to the right of 
 | Delete the selected object | ⌫ | Backspace or Delete |
 | Finish text | Esc, ⌘Enter or a click elsewhere | Esc, Ctrl+Enter or a click elsewhere |
 
-A new hotkey needs ⌘, ⌃ or ⌥ on macOS and Ctrl or Alt on Windows; F keys also work on their own.
+A new hotkey needs ⌘, ⌃ or ⌥ on macOS and Ctrl or Alt in the WinForms build for Windows, while F keys also work on their own. The native Windows build takes any key, PrtScn included; Windows 11 keeps PrtScn for Snipping Tool until the Print screen key is turned off in Settings → Accessibility → Keyboard.
 
 ## macOS
 

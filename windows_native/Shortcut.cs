@@ -20,14 +20,13 @@ readonly record struct Shortcut(uint Value)
     public string Description => ((Value & ControlBit) != 0 ? "Ctrl+" : "") + ((Value & AltBit) != 0 ? "Alt+" : "")
                                  + ((Value & ShiftBit) != 0 ? "Shift+" : "") + KeyName(Key);
 
-    /// Shortcut from a key press; null without Ctrl or Alt (F keys excepted), since such a hotkey would swallow normal typing.
-    /// Alt+F4 is refused too: it closes windows.
+    /// Shortcut from a key press, alone or with modifiers, such as PrtScn; null for a modifier key on its own.
+    /// Alt+F4 is refused: it closes windows.
     public static Shortcut? From(uint key)
     {
         bool control = Pressed(VIRTUAL_KEY.VK_CONTROL), alt = Pressed(VIRTUAL_KEY.VK_MENU), shift = Pressed(VIRTUAL_KEY.VK_SHIFT);
-        var isFunctionKey = key is >= (uint)VIRTUAL_KEY.VK_F1 and <= (uint)VIRTUAL_KEY.VK_F24;
         var isModifier = (VIRTUAL_KEY)key is VIRTUAL_KEY.VK_SHIFT or VIRTUAL_KEY.VK_CONTROL or VIRTUAL_KEY.VK_MENU or VIRTUAL_KEY.VK_LWIN or VIRTUAL_KEY.VK_RWIN;
-        if (isModifier || (!control && !alt && !isFunctionKey) || (alt && !control && !shift && key == (uint)VIRTUAL_KEY.VK_F4))
+        if (isModifier || (alt && !control && !shift && key == (uint)VIRTUAL_KEY.VK_F4))
             return null;
         return new Shortcut(key | (shift ? ShiftBit : 0) | (control ? ControlBit : 0) | (alt ? AltBit : 0));
     }
@@ -42,8 +41,11 @@ readonly record struct Shortcut(uint Value)
             return $"F{key - (uint)VIRTUAL_KEY.VK_F1 + 1}";
         if (key is >= '0' and <= '9' or >= 'A' and <= 'Z')
             return $"{(char)key}";
+        // Extended keys, such as PrtScn, the arrows and Home, are named by their extended scan code;
+        // without the extended flag PrtScn would read as Num *.
+        var scanCode = PInvoke.MapVirtualKey(key, MAP_VIRTUAL_KEY_TYPE.MAPVK_VK_TO_VSC_EX);
         Span<char> name = stackalloc char[32];
-        var length = PInvoke.GetKeyNameText((int)(PInvoke.MapVirtualKey(key, MAP_VIRTUAL_KEY_TYPE.MAPVK_VK_TO_VSC) << 16), name);
+        var length = PInvoke.GetKeyNameText((int)((scanCode & 0xFF) << 16 | ((scanCode & 0xFF00) == 0xE000 ? 1u << 24 : 0)), name);
         return length > 0 ? name[..length].ToString() : $"#{key}";
     }
 

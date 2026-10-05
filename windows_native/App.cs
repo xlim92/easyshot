@@ -129,7 +129,7 @@ sealed unsafe class App : Window
             PInvoke.AppendMenu(menu, MENU_ITEM_FLAGS.MF_STRING | flags, (nuint)command, s);
     }
 
-    /// Records a new shortcut: the next key press with Ctrl or Alt (or an F key) becomes the hotkey.
+    /// Records a new shortcut: the next key press, with or without modifiers, becomes the hotkey.
     private void ChangeShortcut()
     {
         // Unregister the current hotkey while recording, otherwise pressing it would fire it instead of being recorded.
@@ -145,9 +145,21 @@ sealed unsafe class App : Window
         else
         {
             PInvoke.RegisterHotKey(Handle, 1, shortcut.Modifiers, shortcut.Key);
-            if (chosen is { } taken)
+            if (chosen is not { } taken)
+                return;
+            var title = $"{taken.Description} can’t be used";
+            // Windows 11 keeps PrtScn on its own for Snipping Tool; combinations with it are taken only by other apps.
+            if (taken != new Shortcut((uint)VIRTUAL_KEY.VK_SNAPSHOT))
+            {
                 PInvoke.MessageBox(Handle, $"This key combination is already taken by Windows or another app. The shortcut stays {shortcut.Description}.",
-                                   $"{taken.Description} can’t be used", MESSAGEBOX_STYLE.MB_ICONWARNING);
+                                   title, MESSAGEBOX_STYLE.MB_ICONWARNING);
+            }
+            else if (PInvoke.MessageBox(Handle, "Windows keeps PrtScn for Snipping Tool. Turn off the Print screen key in the keyboard settings of Accessibility, " +
+                                                "then set the shortcut again.\n\nOpen these settings?",
+                                        title, MESSAGEBOX_STYLE.MB_YESNO | MESSAGEBOX_STYLE.MB_ICONWARNING) == MESSAGEBOX_RESULT.IDYES)
+            {
+                PInvoke.ShellExecute(HWND.Null, "open", "ms-settings:easeofaccess-keyboard", null, null, SHOW_WINDOW_CMD.SW_SHOWNORMAL);
+            }
         }
     }
 

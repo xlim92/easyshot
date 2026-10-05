@@ -13,7 +13,7 @@ sealed unsafe class ShortcutDialog : Window
 
     private ShortcutDialog(Shortcut current)
     {
-        text = $"Press a new key combination with Ctrl or Alt, or an F key.\n\nCurrent shortcut: {current.Description}";
+        text = $"Press a new key or key combination, such as PrtScn.\n\nCurrent shortcut: {current.Description}";
         // The dialog font of the system at the display's scale.
         var metrics = new NONCLIENTMETRICSW { cbSize = (uint)sizeof(NONCLIENTMETRICSW) };
         PInvoke.SystemParametersInfoForDpi((uint)SYSTEM_PARAMETERS_INFO_ACTION.SPI_GETNONCLIENTMETRICS, metrics.cbSize, &metrics, 0, dpi);
@@ -46,9 +46,10 @@ sealed unsafe class ShortcutDialog : Window
                 PInvoke.PostQuitMessage(0);
                 break;
             }
-            if (message.message is PInvoke.WM_KEYDOWN or PInvoke.WM_SYSKEYDOWN
-                && (message.hwnd == dialog.Handle || PInvoke.IsChild(dialog.Handle, message.hwnd))
-                && dialog.Record((uint)message.wParam.Value))
+            // Windows sends PrtScn to apps only as a key release.
+            var isKey = message.message is PInvoke.WM_KEYDOWN or PInvoke.WM_SYSKEYDOWN
+                        || (message.message is PInvoke.WM_KEYUP or PInvoke.WM_SYSKEYUP && message.wParam.Value == (nuint)VIRTUAL_KEY.VK_SNAPSHOT);
+            if (isKey && (message.hwnd == dialog.Handle || PInvoke.IsChild(dialog.Handle, message.hwnd)) && dialog.Record((uint)message.wParam.Value))
                 continue;
             PInvoke.TranslateMessage(&message);
             PInvoke.DispatchMessage(&message);
@@ -56,7 +57,7 @@ sealed unsafe class ShortcutDialog : Window
         return dialog.chosen;
     }
 
-    /// Esc cancels, a valid combination is chosen; other keys go on to the buttons.
+    /// Esc cancels, any other key is chosen; modifier keys on their own go on to the buttons.
     private bool Record(uint key)
     {
         if (key == (uint)VIRTUAL_KEY.VK_ESCAPE)

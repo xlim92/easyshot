@@ -74,8 +74,9 @@ DeleteDC
 BitBlt
 CreateFontIndirect
 SetBkMode
-// Save dialog, registry
+// Save dialog, registry, settings page
 GetSaveFileName
+ShellExecute
 RegGetValue
 RegSetKeyValue
 HKEY_CURRENT_USER
